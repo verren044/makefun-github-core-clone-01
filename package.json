@@ -1,0 +1,1 @@
+{"description":"A GitHub-compatible git forge: Go static binary (vendored source in *.go) launched by main.ts","engines":{"node":">=22.18"},"license":"MIT","name":"github-core-clone-01","private":true,"type":"module","version":"2.0.0"}
