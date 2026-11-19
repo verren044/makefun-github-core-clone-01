@@ -71,6 +71,12 @@ func gitAdvertiseV0(repo *Repo, service string) []byte {
 }
 
 func gitAdvertiseV2() []byte {
+	return v2AdvertiseBytes
+}
+
+// v2AdvertiseBytes is the whole v2 capability advertisement, computed
+// once: it never varies, and every clone requests it.
+var v2AdvertiseBytes = func() []byte {
 	var out bytes.Buffer
 	out.Write(pktLine([]byte("version 2\n")))
 	for _, cap := range v2Caps {
@@ -78,7 +84,7 @@ func gitAdvertiseV2() []byte {
 	}
 	out.Write(pktFlush)
 	return out.Bytes()
-}
+}()
 
 func handleUploadPackV0(repo *Repo, body []byte) []byte {
 	lines := pktLinesAll(body)
@@ -127,7 +133,7 @@ func handleUploadPackV0(repo *Repo, body []byte) []byte {
 	}
 	if !done {
 		if deepen != nil && len(wants) > 0 {
-			_, boundaries, _ := buildPackFiltered(repo, wants, haves, deepen, oldShallow, false)
+			_, _, boundaries, _ := buildPackFiltered(repo, wants, haves, deepen, oldShallow, false)
 			var out bytes.Buffer
 			for _, w := range sortedKeys(boundaries) {
 				out.Write(pktLine([]byte("shallow " + w + "\n")))
@@ -142,7 +148,7 @@ func handleUploadPackV0(repo *Repo, body []byte) []byte {
 			wants, deepen, oldShallow = repo.LastUpload.Wants, repo.LastUpload.Deepen, repo.LastUpload.OldShallow
 		}
 	}
-	pack, boundaries, _ := buildPackFiltered(repo, wants, haves, deepen, oldShallow, false)
+	_, framed, boundaries, _ := buildPackFiltered(repo, wants, haves, deepen, oldShallow, false)
 	var out bytes.Buffer
 	if len(boundaries) > 0 {
 		for _, w := range sortedKeys(boundaries) {
@@ -151,7 +157,7 @@ func handleUploadPackV0(repo *Repo, body []byte) []byte {
 		out.Write(pktFlush)
 	}
 	out.Write(pktLine([]byte("NAK\n")))
-	out.Write(sidebandPack(pack, 1))
+	out.Write(framed)
 	out.Write(pktFlush)
 	return out.Bytes()
 }
@@ -386,7 +392,7 @@ func handleUploadPackV2(repo *Repo, body []byte) []byte {
 				oldShallow[strings.Split(a[8:], " ")[0]] = true
 			}
 		}
-		pack, boundaries, unshallowed := buildPackFiltered(repo, wants, haves, deepen, oldShallow, deepenRelative)
+		_, framed, boundaries, unshallowed := buildPackFiltered(repo, wants, haves, deepen, oldShallow, deepenRelative)
 		var out bytes.Buffer
 		if len(haves) > 0 && !done {
 			wantCommits := map[string]bool{}
@@ -443,7 +449,7 @@ func handleUploadPackV2(repo *Repo, body []byte) []byte {
 			out.Write(pktDelim)
 		}
 		out.Write(pktLine([]byte("packfile\n")))
-		out.Write(sidebandPack(pack, 1))
+		out.Write(framed)
 		out.Write(pktFlush)
 		return out.Bytes()
 	}

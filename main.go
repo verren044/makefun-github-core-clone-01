@@ -11,8 +11,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -26,6 +28,10 @@ var gitRouteRe = regexp.MustCompile(`^/([^/]+)/([^/]+)\.git(/.*)$`)
 var mcpIDRe = regexp.MustCompile(`"id"\s*:\s*("([^"\\]|\\.)*"|-?\d+)`)
 
 func main() {
+	// Fewer GC cycles: the trial is short-lived and the heap is small
+	// (per-request garbage is a few KB); halving GC frequency removes
+	// pauses from the timed rounds without growing memory materially.
+	debug.SetGCPercent(200)
 	port := 0
 	if v := os.Getenv("FORGE_PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -67,10 +73,22 @@ func main() {
 }
 
 // requestID returns a fresh "req-%06d" (one per response, like v1).
+// Formatted into a stack buffer instead of pad6's loop-concat, which
+// allocated a new string per digit.
 var reqCounter atomic.Int64
 
 func requestID() string {
 	n := reqCounter.Add(1)
+	if n < 1000000 {
+		var b [10]byte
+		b[0], b[1], b[2], b[3] = 'r', 'e', 'q', '-'
+		v := int(n)
+		for i := 9; i >= 4; i-- {
+			b[i] = byte('0' + v%10)
+			v /= 10
+		}
+		return string(b[:])
+	}
 	return "req-" + pad6(int(n))
 }
 
@@ -142,7 +160,13 @@ func dispatch(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, r, 500, "Internal Server Error")
 		}
 	}()
-	raw, _ := io.ReadAll(r.Body)
+	// Fast path: requests without a body (every GET in the read workload,
+	// the advertise GETs in the clone workload) skip the ReadAll buffer
+	// allocation entirely. ContentLength -1 (chunked/unknown) still reads.
+	var raw []byte
+	if r.ContentLength != 0 {
+		raw, _ = io.ReadAll(r.Body)
+	}
 	_ = r.Body.Close()
 	method := r.Method
 	path := r.URL.Path
@@ -150,9 +174,13 @@ func dispatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, 200, jsonBytes(map[string]any{"ok": true}), nil)
 		return
 	}
-	if m := gitRouteRe.FindStringSubmatch(path); m != nil {
-		dispatchGit(w, r, m[1], m[2], m[3], raw)
-		return
+	// Fast path: the git-route regexp only needs to run when the path can
+	// possibly match (it requires ".git/"); every /api/v3 request skips it.
+	if strings.Contains(path, ".git/") {
+		if m := gitRouteRe.FindStringSubmatch(path); m != nil {
+			dispatchGit(w, r, m[1], m[2], m[3], raw)
+			return
+		}
 	}
 	if err := checkAuth(r); err != nil {
 		writeErr(w, r, err.(*apiError).status, err.(*apiError).msg)
@@ -226,6 +254,22 @@ func dispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(path, "/api/v3") {
+		// Fast path: POST /api/v3/repos/{owner}/{name}/issues (the write
+		// workload) skips the generic json.Unmarshal-into-any entirely.
+		// fastIssueCreate returns handled=false for any body it cannot
+		// prove identical, and the generic path below takes over.
+		if method == "POST" && strings.HasPrefix(path, "/api/v3/repos/") {
+			if seg := strings.Split(path, "/"); len(seg) == 7 && seg[3] == "repos" && seg[6] == "issues" {
+				owner, err1 := url.PathUnescape(seg[4])
+				name, err2 := url.PathUnescape(seg[5])
+				if err1 == nil && err2 == nil {
+					if handled, status, payload := fastIssueCreate(owner, name, raw); handled {
+						writeJSON(w, r, status, payload, nil)
+						return
+					}
+				}
+			}
+		}
 		body, err := parseJSONBody(raw)
 		if err != nil {
 			writeErr(w, r, 400, "Invalid JSON")
@@ -238,8 +282,15 @@ func dispatch(w http.ResponseWriter, r *http.Request) {
 		if h := r.Host; h != "" {
 			headers["Host"] = h
 		}
+		// Fast path: no query string means no query values to parse;
+		// restDispatch only ever reads query params that are absent here,
+		// and url.Values.Get on a nil map returns "".
+		var q url.Values
+		if r.URL.RawQuery != "" {
+			q = r.URL.Query()
+		}
 		store.mu.Lock()
-		res, derr := restDispatch(method, path, r.URL.Query(), body, headers)
+		res, derr := restDispatch(method, path, q, body, headers)
 		store.mu.Unlock()
 		if derr != nil {
 			if ae, ok := derr.(*apiError); ok {
