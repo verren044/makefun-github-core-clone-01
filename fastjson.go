@@ -1,384 +1,580 @@
-// fastjson.go — hand-rolled JSON paths for the issue-create hot path.
-//
-// The write workload POSTs 200 issues; the generic path (json.Unmarshal
-// into any + reflection marshal) costs ~15us per op. This file parses only
-// what an issue create needs (title/body/labels) and serializes the
-// response manually, byte-identical to encoding/json with
-// SetEscapeHTML(false). Anything it cannot handle exactly falls back to
-// the generic path — correctness first, speed second.
+// fastjson.go — hand-rolled JSON for the issue-create hot path (the write
+// workload POSTs 200 issues). The generic path (json.Unmarshal into any +
+// reflection marshal) costs ~15 us per op. This reader extracts only
+// title/body/labels and the serializer emits the response byte-identical
+// to encoding/json with SetEscapeHTML(false). Anything it cannot prove
+// identical falls back to the generic path, so behaviour never diverges:
+// invalid JSON -> 400, valid non-object -> empty-map behaviour,
+// whitespace-only -> 400, non-string title/body or odd label elements ->
+// the generic handler decides.
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"strconv"
+	"unicode/utf16"
 	"unicode/utf8"
 )
 
-// appendJSONString appends s as a JSON string literal, exactly as
-// encoding/json does with HTML escaping off: only '"', '\\' and bytes
-// < 0x20 are escaped (\n \r \t short, the rest \u00XX); valid UTF-8
-// passes through; each invalid byte becomes \ufffd.
-func appendJSONString(dst []byte, s string) []byte {
-	dst = append(dst, '"')
-	start := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c == '"' || c == '\\' {
-			if start < i {
-				dst = append(dst, s[start:i]...)
-			}
-			switch c {
-			case '"':
-				dst = append(dst, '\\', '"')
-			case '\\':
-				dst = append(dst, '\\', '\\')
-			case '\n':
-				dst = append(dst, '\\', 'n')
-			case '\r':
-				dst = append(dst, '\\', 'r')
-			case '\t':
-				dst = append(dst, '\\', 't')
-			default:
-				dst = append(dst, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0xf])
-			}
-			start = i + 1
-		} else if c >= 0x80 {
-			// Validate the UTF-8 sequence starting here; encoding/json
-			// replaces each invalid byte with \ufffd.
-			_, size := utf8.DecodeRuneInString(s[i:])
-			if size == 1 && c != utf8.RuneSelf {
-				// DecodeRuneInString returns size 1 for an invalid byte.
-				if start < i {
-					dst = append(dst, s[start:i]...)
-				}
-				dst = append(dst, '\\', 'u', 'f', 'f', 'f', 'd')
-				start = i + 1
-			} else {
-				i += size - 1
-			}
-		}
-	}
-	if start < len(s) {
-		dst = append(dst, s[start:]...)
-	}
-	return append(dst, '"')
-}
+// ---- request parsing ----
 
-// jsonSkipWS returns the first index >= pos that is not JSON whitespace.
-func jsonSkipWS(data []byte, pos int) int {
-	for pos < len(data) {
-		switch data[pos] {
-		case ' ', '\t', '\n', '\r':
-			pos++
-		default:
-			return pos
-		}
-	}
-	return pos
-}
-
-// jsonSkipString returns the index just past the string token starting at
-// data[pos] == '"', honouring backslash escapes. ok=false if unterminated.
-func jsonSkipString(data []byte, pos int) (int, bool) {
-	pos++ // opening quote
-	for pos < len(data) {
-		c := data[pos]
-		if c == '\\' {
-			pos += 2
-			continue
-		}
-		if c == '"' {
-			return pos + 1, true
-		}
-		pos++
-	}
-	return pos, false
-}
-
-// jsonSkipValue returns the index just past the JSON value starting at pos.
-func jsonSkipValue(data []byte, pos int) (int, bool) {
-	pos = jsonSkipWS(data, pos)
-	if pos >= len(data) {
-		return pos, false
-	}
-	switch data[pos] {
-	case '"':
-		return jsonSkipString(data, pos)
-	case '{':
-		pos++
-		pos = jsonSkipWS(data, pos)
-		if pos < len(data) && data[pos] == '}' {
-			return pos + 1, true
-		}
-		for {
-			pos = jsonSkipWS(data, pos)
-			if pos >= len(data) || data[pos] != '"' {
-				return pos, false
-			}
-			var ok bool
-			pos, ok = jsonSkipString(data, pos)
-			if !ok {
-				return pos, false
-			}
-			pos = jsonSkipWS(data, pos)
-			if pos >= len(data) || data[pos] != ':' {
-				return pos, false
-			}
-			pos, ok = jsonSkipValue(data, pos+1)
-			if !ok {
-				return pos, false
-			}
-			pos = jsonSkipWS(data, pos)
-			if pos < len(data) && data[pos] == ',' {
-				pos++
-				continue
-			}
-			if pos < len(data) && data[pos] == '}' {
-				return pos + 1, true
-			}
-			return pos, false
-		}
-	case '[':
-		pos++
-		pos = jsonSkipWS(data, pos)
-		if pos < len(data) && data[pos] == ']' {
-			return pos + 1, true
-		}
-		for {
-			var ok bool
-			pos, ok = jsonSkipValue(data, pos)
-			if !ok {
-				return pos, false
-			}
-			pos = jsonSkipWS(data, pos)
-			if pos < len(data) && data[pos] == ',' {
-				pos++
-				continue
-			}
-			if pos < len(data) && data[pos] == ']' {
-				return pos + 1, true
-			}
-			return pos, false
-		}
-	default:
-		// number, true, false, null: consume until a structural char.
-		for pos < len(data) {
-			switch data[pos] {
-			case ',', '}', ']', ' ', '\t', '\n', '\r':
-				return pos, true
-			}
-			pos++
-		}
-		return pos, true
-	}
-}
-
-type objMember struct {
-	key string
-	val []byte // raw JSON of the value (string tokens include the quotes)
-}
-
-// scanObjectMembers parses a JSON object starting at data[pos] == '{'
-// and returns its members in order. ok=false when the input is not a
-// well-formed object.
-func scanObjectMembers(data []byte, pos int) ([]objMember, bool) {
-	pos = jsonSkipWS(data, pos)
-	if pos >= len(data) || data[pos] != '{' {
+// fastIssueBody parses an issue-create request body without encoding/json.
+// It returns the map restDispatch expects (title/body strings, labels as
+// []any of strings) plus true, or (nil, false) to take the generic path.
+func fastIssueBody(raw []byte) (map[string]any, bool) {
+	i := skipWS(raw, 0)
+	if i >= len(raw) || raw[i] != '{' {
 		return nil, false
 	}
-	pos++
-	pos = jsonSkipWS(data, pos)
-	if pos < len(data) && data[pos] == '}' {
-		return []objMember{}, true
+	i++
+	out := map[string]any{}
+	i = skipWS(raw, i)
+	if i < len(raw) && raw[i] == '}' {
+		i = skipWS(raw, i+1)
+		if i != len(raw) {
+			return nil, false
+		}
+		return out, true
 	}
-	var out []objMember
 	for {
-		pos = jsonSkipWS(data, pos)
-		if pos >= len(data) || data[pos] != '"' {
+		i = skipWS(raw, i)
+		if i >= len(raw) || raw[i] != '"' {
 			return nil, false
 		}
-		end, ok := jsonSkipString(data, pos)
+		name, ni, ok := decodeJSONString(raw, i)
 		if !ok {
 			return nil, false
 		}
-		var key string
-		if err := json.Unmarshal(data[pos:end], &key); err != nil {
+		i = skipWS(raw, ni)
+		if i >= len(raw) || raw[i] != ':' {
 			return nil, false
 		}
-		pos = jsonSkipWS(data, end)
-		if pos >= len(data) || data[pos] != ':' {
+		i = skipWS(raw, i+1)
+		switch name {
+		case "title", "body":
+			if i >= len(raw) || raw[i] != '"' {
+				return nil, false
+			}
+			v, ni, ok := decodeJSONString(raw, i)
+			if !ok {
+				return nil, false
+			}
+			out[name] = v
+			i = ni
+		case "labels":
+			if i >= len(raw) || raw[i] != '[' {
+				return nil, false
+			}
+			labs, ni, ok := parseLabels(raw, i)
+			if !ok {
+				return nil, false
+			}
+			out["labels"] = labs
+			i = ni
+		default:
+			ni, ok := skipValue(raw, i)
+			if !ok {
+				return nil, false
+			}
+			i = ni
+		}
+		i = skipWS(raw, i)
+		if i >= len(raw) {
 			return nil, false
 		}
-		vstart := jsonSkipWS(data, pos+1)
-		vend, ok := jsonSkipValue(data, vstart)
-		if !ok {
-			return nil, false
-		}
-		out = append(out, objMember{key: key, val: data[vstart:vend]})
-		pos = jsonSkipWS(data, vend)
-		if pos < len(data) && data[pos] == ',' {
-			pos++
+		if raw[i] == ',' {
+			i++
 			continue
 		}
-		if pos < len(data) && data[pos] == '}' {
+		if raw[i] == '}' {
+			i = skipWS(raw, i+1)
+			if i != len(raw) {
+				return nil, false
+			}
 			return out, true
 		}
 		return nil, false
 	}
 }
 
-// memberString returns the string value of a member whose value is a JSON
-// string; for any other JSON type it returns "" (matching strVal).
-func memberString(m objMember) string {
-	if len(m.val) == 0 || m.val[0] != '"' {
-		return ""
+// parseLabels parses a labels array: elements must be strings or
+// {"name": string} objects (other members skipped). Returns []any of
+// plain strings, matching what the generic path hands the handler.
+func parseLabels(b []byte, i int) ([]any, int, bool) {
+	// b[i] == '['
+	i++
+	out := []any{}
+	i = skipWS(b, i)
+	if i < len(b) && b[i] == ']' {
+		return out, i + 1, true
 	}
-	var s string
-	if err := json.Unmarshal(m.val, &s); err != nil {
-		return ""
+	for {
+		i = skipWS(b, i)
+		if i >= len(b) {
+			return nil, 0, false
+		}
+		switch b[i] {
+		case '"':
+			v, ni, ok := decodeJSONString(b, i)
+			if !ok {
+				return nil, 0, false
+			}
+			out = append(out, v)
+			i = ni
+		case '{':
+			name, ni, ok := parseLabelObject(b, i)
+			if !ok {
+				return nil, 0, false
+			}
+			out = append(out, name)
+			i = ni
+		default:
+			return nil, 0, false
+		}
+		i = skipWS(b, i)
+		if i >= len(b) {
+			return nil, 0, false
+		}
+		if b[i] == ',' {
+			i++
+			continue
+		}
+		if b[i] == ']' {
+			return out, i + 1, true
+		}
+		return nil, 0, false
 	}
-	return s
 }
 
-// fastIssueCreate handles POST /repos/{owner}/{name}/issues without the
-// generic json.Unmarshal-into-any path. It returns handled=false when the
-// body needs the generic path (invalid JSON, or a shape the fast reader
-// cannot prove identical). On handled=true, status is the HTTP status and
-// body the response bytes (with trailing newline, as the generic path).
-func fastIssueCreate(owner, name string, raw []byte) (handled bool, status int, body []byte) {
-	// Empty body: the generic path creates an issue with empty fields
-	// (parseJSONBody returns nil, bodyMap(nil) is an empty map), so the
-	// fast path does the same. Whitespace-only is NOT empty: the generic
-	// path rejects it as invalid JSON, so it must fall through below.
-	var members []objMember
-	if len(raw) == 0 {
-		members = []objMember{}
-	} else {
-		var ok bool
-		members, ok = scanObjectMembers(raw, 0)
+// parseLabelObject extracts the "name" member of a {"name": ...} label
+// object (last "name" wins, like encoding/json); other members are skipped.
+func parseLabelObject(b []byte, i int) (string, int, bool) {
+	// b[i] == '{'
+	i++
+	name := ""
+	i = skipWS(b, i)
+	if i < len(b) && b[i] == '}' {
+		return name, i + 1, true
+	}
+	for {
+		i = skipWS(b, i)
+		if i >= len(b) || b[i] != '"' {
+			return "", 0, false
+		}
+		m, ni, ok := decodeJSONString(b, i)
 		if !ok {
-			if json.Valid(raw) {
-				// Valid JSON but not an object: the generic path treats
-				// it as an empty map.
-				members = []objMember{}
-			} else {
-				return false, 0, nil // generic path reports 400
+			return "", 0, false
+		}
+		i = skipWS(b, ni)
+		if i >= len(b) || b[i] != ':' {
+			return "", 0, false
+		}
+		i = skipWS(b, i+1)
+		if m == "name" {
+			if i >= len(b) || b[i] != '"' {
+				return "", 0, false
 			}
+			v, ni, ok := decodeJSONString(b, i)
+			if !ok {
+				return "", 0, false
+			}
+			name = v
+			i = ni
+		} else {
+			ni, ok := skipValue(b, i)
+			if !ok {
+				return "", 0, false
+			}
+			i = ni
+		}
+		i = skipWS(b, i)
+		if i >= len(b) {
+			return "", 0, false
+		}
+		if b[i] == ',' {
+			i++
+			continue
+		}
+		if b[i] == '}' {
+			return name, i + 1, true
+		}
+		return "", 0, false
+	}
+}
+
+func skipWS(b []byte, i int) int {
+	for i < len(b) {
+		switch b[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		default:
+			return i
 		}
 	}
-	var title, bdy string
-	var labelNames []string
-	for _, m := range members {
-		switch m.key {
-		case "title":
-			title = memberString(m)
-		case "body":
-			bdy = memberString(m)
-		case "labels":
-			if len(m.val) == 0 || m.val[0] != '[' {
-				continue // generic path ignores a non-array labels value
+	return i
+}
+
+// skipValue skips one JSON value starting at i (which must not be
+// whitespace) and returns the position just past it. It validates the
+// value's shape strictly enough that anything malformed returns false
+// (the caller then falls back to the generic path, which reports 400).
+func skipValue(b []byte, i int) (int, bool) {
+	if i >= len(b) {
+		return 0, false
+	}
+	switch c := b[i]; {
+	case c == '"':
+		_, ni, ok := decodeJSONString(b, i)
+		return ni, ok
+	case c == '{':
+		i++
+		i = skipWS(b, i)
+		if i < len(b) && b[i] == '}' {
+			return i + 1, true
+		}
+		for {
+			i = skipWS(b, i)
+			if i >= len(b) || b[i] != '"' {
+				return 0, false
 			}
-			// Walk the array elements.
-			pos := 1
-			for {
-				pos = jsonSkipWS(m.val, pos)
-				if pos >= len(m.val) {
-					return false, 0, nil
+			_, ni, ok := decodeJSONString(b, i)
+			if !ok {
+				return 0, false
+			}
+			i = skipWS(b, ni)
+			if i >= len(b) || b[i] != ':' {
+				return 0, false
+			}
+			ni, ok = skipValue(b, skipWS(b, i+1))
+			if !ok {
+				return 0, false
+			}
+			i = skipWS(b, ni)
+			if i >= len(b) {
+				return 0, false
+			}
+			if b[i] == ',' {
+				i++
+				continue
+			}
+			if b[i] == '}' {
+				return i + 1, true
+			}
+			return 0, false
+		}
+	case c == '[':
+		i++
+		i = skipWS(b, i)
+		if i < len(b) && b[i] == ']' {
+			return i + 1, true
+		}
+		for {
+			ni, ok := skipValue(b, skipWS(b, i))
+			if !ok {
+				return 0, false
+			}
+			i = skipWS(b, ni)
+			if i >= len(b) {
+				return 0, false
+			}
+			if b[i] == ',' {
+				i++
+				continue
+			}
+			if b[i] == ']' {
+				return i + 1, true
+			}
+			return 0, false
+		}
+	case c == 't':
+		if len(b)-i >= 4 && string(b[i:i+4]) == "true" {
+			return i + 4, true
+		}
+		return 0, false
+	case c == 'f':
+		if len(b)-i >= 5 && string(b[i:i+5]) == "false" {
+			return i + 5, true
+		}
+		return 0, false
+	case c == 'n':
+		if len(b)-i >= 4 && string(b[i:i+4]) == "null" {
+			return i + 4, true
+		}
+		return 0, false
+	case c == '-' || (c >= '0' && c <= '9'):
+		return skipNumber(b, i)
+	default:
+		return 0, false
+	}
+}
+
+// skipNumber validates strict JSON number grammar:
+// -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+func skipNumber(b []byte, i int) (int, bool) {
+	j := i
+	if j < len(b) && b[j] == '-' {
+		j++
+	}
+	if j >= len(b) {
+		return 0, false
+	}
+	if b[j] == '0' {
+		j++
+	} else if b[j] >= '1' && b[j] <= '9' {
+		for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+			j++
+		}
+	} else {
+		return 0, false
+	}
+	if j < len(b) && b[j] == '.' {
+		j++
+		if j >= len(b) || b[j] < '0' || b[j] > '9' {
+			return 0, false
+		}
+		for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+			j++
+		}
+	}
+	if j < len(b) && (b[j] == 'e' || b[j] == 'E') {
+		j++
+		if j < len(b) && (b[j] == '+' || b[j] == '-') {
+			j++
+		}
+		if j >= len(b) || b[j] < '0' || b[j] > '9' {
+			return 0, false
+		}
+		for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+			j++
+		}
+	}
+	return j, true
+}
+
+func hexVal(c byte) (int, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0'), true
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10, true
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10, true
+	}
+	return 0, false
+}
+
+// decodeJSONString decodes a JSON string starting at b[i] == '"' with
+// encoding/json's exact semantics: escapes, \uXXXX with surrogate pairs
+// (lone surrogates -> U+FFFD), invalid UTF-8 bytes -> U+FFFD each, raw
+// control bytes -> not valid JSON (false).
+func decodeJSONString(b []byte, i int) (string, int, bool) {
+	// b[i] == '"'
+	i++
+	// Fast path: no escapes, pure ASCII.
+	j := i
+	for j < len(b) && b[j] != '"' && b[j] != '\\' {
+		if b[j] < 0x20 {
+			return "", 0, false
+		}
+		j++
+	}
+	if j < len(b) && b[j] == '"' {
+		if j == i {
+			return "", j + 1, true
+		}
+		// All ASCII so far; the raw slice is the decoded string only if
+		// it holds no byte >= 0x80 (multi-byte UTF-8 is fine as-is, but
+		// invalid bytes need U+FFFD substitution, so check).
+		s := b[i:j]
+		if utf8.Valid(s) {
+			return string(s), j + 1, true
+		}
+	}
+	out := make([]byte, 0, 64)
+	for i < len(b) {
+		c := b[i]
+		switch {
+		case c == '"':
+			return string(out), i + 1, true
+		case c == '\\':
+			i++
+			if i >= len(b) {
+				return "", 0, false
+			}
+			switch b[i] {
+			case '"':
+				out = append(out, '"')
+				i++
+			case '\\':
+				out = append(out, '\\')
+				i++
+			case '/':
+				out = append(out, '/')
+				i++
+			case 'b':
+				out = append(out, '\b')
+				i++
+			case 'f':
+				out = append(out, '\f')
+				i++
+			case 'n':
+				out = append(out, '\n')
+				i++
+			case 'r':
+				out = append(out, '\r')
+				i++
+			case 't':
+				out = append(out, '\t')
+				i++
+			case 'u':
+				if i+4 >= len(b) {
+					return "", 0, false
 				}
-				if m.val[pos] == ']' {
-					break
-				}
-				end, ok := jsonSkipValue(m.val, pos)
-				if !ok {
-					return false, 0, nil
-				}
-				elem := m.val[pos:end]
-				var lname string
-				if len(elem) > 0 && elem[0] == '"' {
-					if err := json.Unmarshal(elem, &lname); err != nil {
-						return false, 0, nil
-					}
-				} else if len(elem) > 0 && elem[0] == '{' {
-					em, ok := scanObjectMembers(elem, 0)
+				r := 0
+				for k := 1; k <= 4; k++ {
+					v, ok := hexVal(b[i+k])
 					if !ok {
-						return false, 0, nil
+						return "", 0, false
 					}
-					for _, emm := range em {
-						if emm.key == "name" {
-							lname = memberString(emm)
+					r = r<<4 | v
+				}
+				i += 5
+				if r >= 0xD800 && r <= 0xDBFF {
+					// High surrogate: needs a following \uDC00-\uDFFF.
+					if i+5 < len(b) && b[i] == '\\' && b[i+1] == 'u' {
+						r2 := 0
+						ok2 := true
+						for k := 2; k <= 5; k++ {
+							v, ok := hexVal(b[i+k])
+							if !ok {
+								ok2 = false
+								break
+							}
+							r2 = r2<<4 | v
+						}
+						if ok2 && r2 >= 0xDC00 && r2 <= 0xDFFF {
+							out = utf8.AppendRune(out, utf16.DecodeRune(rune(r), rune(r2)))
+							i += 6
+							continue
 						}
 					}
-				}
-				// Any other element type leaves lname "" (generic path:
-				// the switch falls through with lname ""), which then
-				// fails the label-existence check below.
-				labelNames = append(labelNames, lname)
-				pos = jsonSkipWS(m.val, end)
-				if pos < len(m.val) && m.val[pos] == ',' {
-					pos++
+					out = utf8.AppendRune(out, utf8.RuneError)
 					continue
 				}
-				if pos < len(m.val) && m.val[pos] == ']' {
-					break
+				if r >= 0xDC00 && r <= 0xDFFF {
+					out = utf8.AppendRune(out, utf8.RuneError)
+					continue
 				}
-				return false, 0, nil
+				out = utf8.AppendRune(out, rune(r))
+			default:
+				return "", 0, false
+			}
+		case c < 0x20:
+			return "", 0, false
+		case c < 0x80:
+			out = append(out, c)
+			i++
+		default:
+			r, size := utf8.DecodeRune(b[i:])
+			if r == utf8.RuneError && size == 1 {
+				out = utf8.AppendRune(out, utf8.RuneError)
+				i++
+			} else {
+				out = append(out, b[i:i+size]...)
+				i += size
 			}
 		}
 	}
-	if err := requireOwner(owner); err != nil {
-		return true, 404, jsonBytes(map[string]any{"message": "Not Found"})
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	repo, ok := store.repos[[2]string{owner, name}]
-	if !ok {
-		return true, 404, jsonBytes(map[string]any{"message": "Not Found"})
-	}
-	for _, lname := range labelNames {
-		if _, ok := repo.Labels[lname]; !ok {
-			return true, 422, jsonBytes(map[string]any{"message": "Label does not exist"})
+	return "", 0, false
+}
+
+// ---- response serializing ----
+
+// appendJSONString appends s quoted exactly like encoding/json with
+// SetEscapeHTML(false): only '"', '\\' and bytes < 0x20 are escaped
+// (\u2028/\u2029 are escaped too, as encoding/json always does); valid
+// UTF-8 passes through; each invalid byte becomes U+FFFD.
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
+		case c == '"':
+			dst = append(dst, '\\', '"')
+			i++
+		case c == '\\':
+			dst = append(dst, '\\', '\\')
+			i++
+		case c == '\n':
+			dst = append(dst, '\\', 'n')
+			i++
+		case c == '\r':
+			dst = append(dst, '\\', 'r')
+			i++
+		case c == '\t':
+			dst = append(dst, '\\', 't')
+			i++
+		case c < 0x20:
+			dst = append(dst, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0xf])
+			i++
+		case c < 0x80:
+			dst = append(dst, c)
+			i++
+		default:
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && size == 1 {
+				dst = append(dst, `\ufffd`...)
+				i++
+			} else if r == '\u2028' {
+				dst = append(dst, `\u2028`...)
+				i += size
+			} else if r == '\u2029' {
+				dst = append(dst, `\u2029`...)
+				i += size
+			} else {
+				dst = append(dst, s[i:i+size]...)
+				i += size
+			}
 		}
 	}
-	num := repo.NextIssue
-	repo.NextIssue++
-	issue := newIssue(repo, num, title, bdy, labelNames)
-	repo.Issues[num] = issue
-	repo.IssueOrder = append(repo.IssueOrder, num)
-	// Manual serialization, byte-identical to issueRestJSON + "\n".
-	var buf bytes.Buffer
-	buf.WriteString(`{"id":`)
-	buf.WriteString(strconv.Itoa(issue.Number*100000 + issue.Repo.DBID))
-	buf.WriteString(`,"node_id":`)
-	buf.Write(appendJSONString(nil, issue.GID))
-	buf.WriteString(`,"number":`)
-	buf.WriteString(strconv.Itoa(issue.Number))
-	buf.WriteString(`,"title":`)
-	buf.Write(appendJSONString(nil, issue.Title))
-	buf.WriteString(`,"body":`)
-	buf.Write(appendJSONString(nil, issue.Body))
-	buf.WriteString(`,"state":`)
-	buf.Write(appendJSONString(nil, issue.State))
-	buf.WriteString(`,"labels":[`)
-	for i, ln := range labelNames {
+	dst = append(dst, '"')
+	return dst
+}
+
+// fastIssueResponse serializes an issue exactly like issueRestJSON (same
+// field order, same escaping, no trailing newline) and is used to populate
+// cachedRest. It returns nil only if a field cannot be proven identical,
+// in which case the caller falls back to issueRestJSON.
+func fastIssueResponse(issue *Issue) []byte {
+	out := make([]byte, 0, 256)
+	out = append(out, `{"id":`...)
+	out = strconv.AppendInt(out, int64(issue.Number*100000+issue.Repo.DBID), 10)
+	out = append(out, `,"node_id":`...)
+	out = appendJSONString(out, issue.GID)
+	out = append(out, `,"number":`...)
+	out = strconv.AppendInt(out, int64(issue.Number), 10)
+	out = append(out, `,"title":`...)
+	out = appendJSONString(out, issue.Title)
+	out = append(out, `,"body":`...)
+	out = appendJSONString(out, issue.Body)
+	out = append(out, `,"state":`...)
+	out = appendJSONString(out, issue.State)
+	out = append(out, `,"labels":[`...)
+	for i, n := range issue.Labels {
 		if i > 0 {
-			buf.WriteByte(',')
+			out = append(out, ',')
 		}
-		buf.WriteString(`{"name":`)
-		buf.Write(appendJSONString(nil, ln))
-		buf.WriteByte('}')
+		out = append(out, `{"name":`...)
+		out = appendJSONString(out, n)
+		out = append(out, '}')
 	}
-	buf.WriteString(`],"user":{"login":`)
-	buf.Write(appendJSONString(nil, viewerLogin))
-	buf.WriteString(`,"id":`)
-	buf.WriteString(strconv.Itoa(viewer.ID))
-	buf.WriteString(`},"created_at":`)
-	buf.Write(appendJSONString(nil, issue.CreatedAt))
-	buf.WriteString(`,"updated_at":`)
-	buf.Write(appendJSONString(nil, issue.UpdatedAt))
-	buf.WriteString(`,"html_url":"","url":""}`)
-	buf.WriteByte('\n')
-	// Keep the read path's cache consistent with the generic path.
-	issue.cachedRest = bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
-	return true, 201, buf.Bytes()
+	out = append(out, `],"user":{"login":`...)
+	out = appendJSONString(out, viewerLogin)
+	out = append(out, `,"id":`...)
+	out = strconv.AppendInt(out, int64(viewer.ID), 10)
+	out = append(out, `},"created_at":`...)
+	out = appendJSONString(out, issue.CreatedAt)
+	out = append(out, `,"updated_at":`...)
+	out = appendJSONString(out, issue.UpdatedAt)
+	out = append(out, `,"html_url":"","url":""}`...)
+	return out
 }

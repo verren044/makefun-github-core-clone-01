@@ -70,21 +70,23 @@ func gitAdvertiseV0(repo *Repo, service string) []byte {
 	return out.Bytes()
 }
 
-func gitAdvertiseV2() []byte {
-	return v2AdvertiseBytes
-}
+// v2Advertise is the v2 capability advertisement, computed once at init:
+// it is identical for every repository and every request.
+var v2Advertise []byte
 
-// v2AdvertiseBytes is the whole v2 capability advertisement, computed
-// once: it never varies, and every clone requests it.
-var v2AdvertiseBytes = func() []byte {
+func init() {
 	var out bytes.Buffer
 	out.Write(pktLine([]byte("version 2\n")))
 	for _, cap := range v2Caps {
 		out.Write(pktLine([]byte(cap + "\n")))
 	}
 	out.Write(pktFlush)
-	return out.Bytes()
-}()
+	v2Advertise = out.Bytes()
+}
+
+func gitAdvertiseV2() []byte {
+	return v2Advertise
+}
 
 func handleUploadPackV0(repo *Repo, body []byte) []byte {
 	lines := pktLinesAll(body)

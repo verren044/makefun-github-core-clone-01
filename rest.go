@@ -597,6 +597,12 @@ func restRepoSub(method string, tail []string, query url.Values, body any, owner
 			issue := newIssue(repo, num, strVal(data, "title", ""), strVal(data, "body", ""), labelNames)
 			repo.Issues[num] = issue
 			repo.IssueOrder = append(repo.IssueOrder, num)
+			// Fast path: the manual serializer emits the same bytes as
+			// issueRestJSON and populates cachedRest from them.
+			if fb := fastIssueResponse(issue); fb != nil {
+				issue.cachedRest = fb
+				return restResult{status: 201, body: append(fb, '\n')}, nil
+			}
 			return restResult{status: 201, body: append(issueRestJSON(issue), '\n')}, nil
 		}
 		return restResult{}, err404()

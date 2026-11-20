@@ -16,17 +16,14 @@ import (
 	"strings"
 )
 
+// hexDigits is the lookup table for the 4-hex-digit pkt-line length prefix:
+// every advertisement line, status line and sideband chunk pays for one.
 const hexDigits = "0123456789abcdef"
 
-// pktLine frames data as one pkt-line. The length prefix is written from
-// a lookup table instead of fmt.Sprintf: pktLine is called for every
-// advertisement line, shallow line, status line and sideband chunk, and
-// Sprintf costs ~1us per call on this hot path. n < 65536 always holds
-// (sideband chunks are at most 65520 bytes total).
 func pktLine(data []byte) []byte {
 	n := len(data) + 4
 	out := make([]byte, 0, len(data)+4)
-	out = append(out, hexDigits[n>>12&0xf], hexDigits[n>>8&0xf], hexDigits[n>>4&0xf], hexDigits[n&0xf])
+	out = append(out, hexDigits[(n>>12)&0xf], hexDigits[(n>>8)&0xf], hexDigits[(n>>4)&0xf], hexDigits[n&0xf])
 	return append(out, data...)
 }
 
@@ -286,11 +283,10 @@ func readZlib(br *bytes.Reader) ([]byte, error) {
 	return io.ReadAll(zr)
 }
 
+// zlibCompress uses BestSpeed: packs are built once per cache key and served
+// verbatim, so compression speed (not ratio) is what the benchmark pays.
 func zlibCompress(data []byte) []byte {
 	var buf bytes.Buffer
-	// BestSpeed: pack bytes are produced once per cache key and then
-	// served verbatim, so compression speed (not ratio) is what the
-	// benchmark pays for. Output is valid zlib at any level.
 	w, _ := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
 	w.Write(data)
 	w.Close()
@@ -352,11 +348,7 @@ func reachableTreeObjects(repo *Repo, treeSHA string) map[string]bool {
 }
 
 // buildPackFiltered builds a packfile for a fetch, and reports the shallow
-// bookkeeping. Returns (pack, framed, boundaries, unshallowed), where
-// framed is the pack already sideband-framed (channel 1): the clone
-// workload serves the same framed bytes to 50 concurrent clones, so
-// framing once per cache key instead of once per clone removes a full
-// pack copy + pkt-line formatting from every clone after the first.
+// bookkeeping. Returns (pack, boundaries, unshallowed).
 type cachedPack struct {
 	pack        []byte
 	framed      []byte
@@ -380,6 +372,9 @@ func packCacheKey(wants []string, haves map[string]bool, deepen *int, oldShallow
 	return strings.Join(ws, ",") + "|" + strings.Join(sortedKeys(haves), ",") + "|" + d + "|" + strings.Join(sortedKeys(oldShallow), ",") + "|" + dr
 }
 
+// buildPackFiltered returns (pack, framed, boundaries, unshallowed): framed
+// is the pack already sideband-framed (channel 1), memoized with the pack
+// so the 50 concurrent clones share one framing instead of one per clone.
 func buildPackFiltered(repo *Repo, wants []string, haves map[string]bool, deepen *int, oldShallow map[string]bool, deepenRelative bool) ([]byte, []byte, map[string]bool, map[string]bool) {
 	key := packCacheKey(wants, haves, deepen, oldShallow, deepenRelative)
 	if v, ok := repo.packCache.Load(key); ok {

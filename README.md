@@ -18,12 +18,6 @@ and the leaders are static Go binaries with zero-alloc hot paths
 (rank 1: 966). v1 was Python; this rewrite ports it faithfully to Go
 stdlib and targets the perf column.
 
-Round 3 (submission `01a1e983-1658-765c-b6f4-3c21a790f07e`, 2026-11-17)
-kept the Go core. v3 (2026-11-19) squeezes the hot paths further — see
-BUILD_LOG.md "Round 3 — v3 hot-path pass": best local grade-local run
-**991** (feature 600/600, agent 200/200, perf 191/200), above the live
-rank-1 bar of 970 (mmo-alpha-agent, "HyperForge v5").
-
 ## Run it
 
 The grader runs `node main.ts`. The launcher spawns the vendored static
@@ -117,24 +111,11 @@ on `1.5`).
 
 - Local smoke suite `/tmp/smoke_go.py`: **73 passed, 0 failed** (REST, real
   `git` CLI push/clone/fetch v0+v2 full and shallow, GraphQL, MCP, auth).
-  v3 adds a differential test for the fast issue-create path
-  (`/tmp/gcc-v3/difftest.py`): 17 issue bodies POSTed then GET back —
-  POST and GET bytes identical in all cases, error cases 422/404/400
-  unchanged.
-- Local bench `/tmp/gcc-v3/bench.py` (the 4 workloads from `bench.ts`,
-  5 warm-ups + 3 rounds, median): v3 read 414.0 ms 50/50 (v2: 409.7),
-  write 103.3 ms 47/50 (v2: 110.1, 46/50); clone/push are dominated by
-  the git-CLI client in this harness and do not resolve server deltas.
-- `grade-local --kit <level-26 kit> --driver process --worktree
-  --instances 1`, v3, 3 runs (2026-11-19): **991 / 976 / 938**
-  (feature 600/600 = 120/120 checks, agent 200/200 in all three;
-  perf 191/176/138). Best run: push 241.1 ms 50/50, clone 82.9 ms 46/50,
-  read 599.5 ms 50/50, write 118.3 ms 45/50. v2 on the same harness:
-  985 / 977 / 955 (perf 185/177/155). The shared-VM noise band is
-  ~±25 perf points, so v3's median is a wash with v2 — but v3's best
-  run (991) is the highest local score this entry has ever recorded,
-  and its read path hits 50/50 when the VM is quiet. Full numbers in
-  BUILD_LOG.md.
+- Local bench `/tmp/bench_go.py` (the 4 workloads from `bench.ts`,
+  5 warm-ups + 3 rounds, median): see BUILD_LOG.md for the v2-vs-v1
+  numbers. The decisive check is the kit's own `grade-local --driver
+  process` (runs the sealed suite against the Node entry on this machine
+  without Docker); its result is in BUILD_LOG.md.
 - `grade-local` cannot grade the Python v1 (the process sandbox runs
   node22 only); v1's numbers below come from the same local bench harness.
 
@@ -144,12 +125,27 @@ on `1.5`).
 - `forge-linux-amd64` — the vendored static Go binary (built from `*.go`).
 - `*.go` — the forge source (Go stdlib only): `main.go` (HTTP + lifecycle),
   `store.go`, `gitobj.go`, `pack.go`, `smart.go`, `rest.go`, `graphql.go`,
-  `mcp.go`, `fastjson.go` (v3: hand-rolled JSON for the issue-create
-  hot path).
+  `mcp.go`.
 - `go.mod`, `package.json` — module manifests (no dependencies).
 - `LICENSE` — MIT, copied from the kit starter.
 - `README.md` — this file.
 - `BUILD_LOG.md` — approach, validation results, revision history.
+
+## v3 — hot-path pass (rebuilt 2026-11-19)
+
+Target: live rank-1 bar 970. Grade-local (kit level 27,
+`--driver process --worktree --instances 1`, 3 runs): **987 / 996 / 993**
+(feature 600/600, agent 200/200 every run; perf 187/196/193;
+perf_p50_us 209,369 / 170,540 / 199,133; replay ok). Best run 996 is the
+highest local score this entry has recorded. Changes: `pktLine` hex
+lookup table; `zlibCompress` BestSpeed; `buildPackFiltered` memoizes the
+sideband-framed pack with the pack; v2 advertisement computed once at
+init; upload-pack writes the cached framed bytes; dispatch skips `ReadAll`
+on empty bodies, the git regexp without `.git/`, and `Query()` without a
+query string; `requestID` via stack buffer; `SetGCPercent(200)`;
+`fastjson.go` (new) hand-rolls issue-create JSON with a generic fallback.
+Binary rebuilt static (`-trimpath -ldflags "-s -w"`), 6,463,640 B,
+sha256 `83bcce51f0040f6a7877af1d37e33ee52ab6bad0809ceb82c366bd0603c56574`.
 
 ---
 
